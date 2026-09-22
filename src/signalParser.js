@@ -67,17 +67,19 @@ function parseScheduledAt(timeStr, baseDate) {
 
 /**
  * Parseia uma linha no formato: M5;USDJPY;15:05;CALL
- * ou com índice numérico prefixado: 63. M15;AUDJPY;15:00;CALL
+ * ou com índice numérico prefixado:
+ *   63. M15;AUDJPY;15:00;CALL
+ *   63 - M15;AUDJPY;15:00;CALL
  * Retorna objeto de sinal ou null se a linha for inválida.
  */
 function parseLine(line, baseDate, index) {
   const trimmed = line.trim();
   if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) return null;
 
-  // Detecta e remove prefixo numérico: "63. M15;AUDJPY;15:00;CALL"
+  // Detecta e remove prefixo numérico: "63. M15..." ou "63 - M15..."
   let signalIndex = null;
   let content = trimmed;
-  const prefixMatch = trimmed.match(/^(\d+)\.\s*/);
+  const prefixMatch = trimmed.match(/^(\d+)\s*(?:[.-])\s*/);
   if (prefixMatch) {
     signalIndex = parseInt(prefixMatch[1], 10);
     content = trimmed.slice(prefixMatch[0].length);
@@ -116,6 +118,50 @@ function parseLine(line, baseDate, index) {
 }
 
 /**
+ * Tenta encontrar uma data no texto completo da lista, como "21/09/2026".
+ * Útil para mensagens do Telegram que trazem a data no cabeçalho.
+ */
+function extractBaseDateFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+
+  const match = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/);
+  if (!match) return null;
+
+  const day = parseInt(match[1], 10);
+  const month = parseInt(match[2], 10);
+  const year = parseInt(match[3], 10);
+  if (day < 1 || day > 31 || month < 1 || month > 12) return null;
+
+  const parsed = new Date(year, month - 1, day);
+  if (
+    parsed.getFullYear() !== year ||
+    parsed.getMonth() !== month - 1 ||
+    parsed.getDate() !== day
+  ) {
+    return null;
+  }
+
+  parsed.setHours(0, 0, 0, 0);
+  return parsed;
+}
+
+function addDays(date, days) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+/**
+ * No Telegram, a data do cabeçalho indica quando a lista foi enviada.
+ * Os sinais da lista são para o dia seguinte.
+ */
+function extractTelegramSignalDateFromText(text) {
+  const headerDate = extractBaseDateFromText(text);
+  if (!headerDate) return null;
+  return addDays(headerDate, 1);
+}
+
+/**
  * Parseia o texto completo da lista de sinais.
  *
  * @param {string} text     - Texto colado pelo usuário
@@ -142,4 +188,10 @@ function parseSignals(text, baseDate) {
   return { signals, skipped };
 }
 
-module.exports = { parseSignals, toDerivSymbol, parseDuration };
+module.exports = {
+  parseSignals,
+  toDerivSymbol,
+  parseDuration,
+  extractBaseDateFromText,
+  extractTelegramSignalDateFromText,
+};

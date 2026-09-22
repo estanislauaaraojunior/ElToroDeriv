@@ -5,12 +5,16 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && node --check src/loadEnv.js && node --check src/derivClient.js && node --check src/galeManager.js && node --check src/scheduler.js && node --check src/signalParser.js && node --check src/telegramSignalSource.js && node --check src/telegramUserSignalSource.js && node --check scripts/telegram-login.js && node --check scripts/telegram-list-chats.js && node --check test-connection.js",
+    "telegram:login": "node scripts/telegram-login.js",
+    "telegram:chats": "node scripts/telegram-list-chats.js"
   },
   "dependencies": {
+    "date-fns": "^3.6.0",
     "express": "^4.19.2",
     "socket.io": "^4.7.5",
-    "ws": "^8.17.1",
-    "date-fns": "^3.6.0"
+    "telegram": "^2.26.22",
+    "ws": "^8.17.1"
   }
 }

@@ -1,5 +1,7 @@
 'use strict';
 
+require('./src/loadEnv')();
+
 const path = require('path');
 const express = require('express');
 const { createServer } = require('http');
@@ -9,7 +11,12 @@ const DerivClient = require('./src/derivClient');
 const GaleManager = require('./src/galeManager');
 const Scheduler = require('./src/scheduler');
 const TelegramSignalSource = require('./src/telegramSignalSource');
-const { parseSignals } = require('./src/signalParser');
+const TelegramUserSignalSource = require('./src/telegramUserSignalSource');
+const {
+  parseSignals,
+  extractBaseDateFromText,
+  extractTelegramSignalDateFromText,
+} = require('./src/signalParser');
 
 const PORT = process.env.PORT || 3000;
 
@@ -26,6 +33,49 @@ app.use(express.static(path.join(__dirname, 'public'), {
 }));
 
 const telegramSessions = new Map();
+const telegramTodayEvents = new Map();
+
+function isToday(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  if (isNaN(d.getTime())) return false;
+  const now = new Date();
+  return (
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  );
+}
+
+function telegramEventKey(event) {
+  return `${event.chatId || 'chat'}:${event.messageId || event.updateId || Date.now()}`;
+}
+
+function cacheTelegramEvent(event) {
+  const textDate = extractTelegramSignalDateFromText(event.text || '');
+  if (!isToday(textDate || event.receivedAt || new Date())) return;
+  telegramTodayEvents.set(telegramEventKey(event), event);
+}
+
+function applyTelegramEventToSession(session, event) {
+  const key = telegramEventKey(event);
+  if (session.telegramMessageKeys.has(key)) return false;
+  if (!session.isConnected()) return false;
+
+  session.telegramMessageKeys.add(key);
+  const result = session.scheduleFromPayload({
+    signalsText: event.text,
+    source: 'telegram',
+  });
+  return !!result.ok;
+}
+
+function replayTodayTelegramEvents(session) {
+  let delivered = 0;
+  for (const event of telegramTodayEvents.values()) {
+    if (applyTelegramEventToSession(session, event)) delivered++;
+  }
+  return delivered;
+}
 
 function parseBaseDate(date) {
   if (!date) {
@@ -75,7 +125,8 @@ function scheduleSignalsForSession({
   if (takeProfit != null) scheduler.tpAmount = parseFloat(takeProfit) || 0;
   if (minPayout != null) scheduler.minPayout = parseFloat(minPayout) || 0;
 
-  const baseDate = parseBaseDate(date);
+  const textDate = fromTelegram ? extractTelegramSignalDateFromText(signalsText) : null;
+  const baseDate = textDate || parseBaseDate(date);
   if (!baseDate) {
     emit('error', { message: 'Data inválida. Use o formato DD/MM/AAAA.' });
     return { ok: false, reason: 'invalid_date' };
@@ -115,17 +166,34 @@ function scheduleSignalsForSession({
 
 const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
 const telegramChatId = process.env.TELEGRAM_CHAT_ID?.trim();
+const telegramApiId = process.env.TELEGRAM_API_ID?.trim();
+const telegramApiHash = process.env.TELEGRAM_API_HASH?.trim();
+const telegramSession = process.env.TELEGRAM_SESSION?.trim();
+const telegramHistoryLimit = process.env.TELEGRAM_HISTORY_LIMIT?.trim();
 
-const telegramSource = telegramBotToken
-  ? new TelegramSignalSource({
+let telegramSource = null;
+if (telegramSession) {
+  telegramSource = new TelegramUserSignalSource({
+    apiId: telegramApiId,
+    apiHash: telegramApiHash,
+    session: telegramSession,
+    chatId: telegramChatId,
+    historyLimit: telegramHistoryLimit,
+    onLog: (level, msg) => {
+      const logger = level === 'error' ? console.error : console.log;
+      logger(`[Telegram] ${msg}`);
+    },
+  });
+} else if (telegramBotToken) {
+  telegramSource = new TelegramSignalSource({
       botToken: telegramBotToken,
       chatId: telegramChatId,
       onLog: (level, msg) => {
         const logger = level === 'error' ? console.error : console.log;
         logger(`[Telegram] ${msg}`);
       },
-    })
-  : null;
+    });
+}
 
 // ─── Sessão por Socket ────────────────────────────────────────────────────────
 // Cada conexão Socket.io tem sua própria instância de DerivClient + state.
@@ -165,10 +233,12 @@ io.on('connection', (socket) => {
     ...payload,
   });
 
-  telegramSessions.set(socket.id, {
+  const telegramSessionState = {
     isConnected: () => !!derivClient?.isConnected,
     scheduleFromPayload,
-  });
+    telegramMessageKeys: new Set(),
+  };
+  telegramSessions.set(socket.id, telegramSessionState);
 
   // ─── Conectar à Deriv ─────────────────────────────────────────────────────
 
@@ -232,6 +302,15 @@ io.on('connection', (socket) => {
         });
 
         startHealthCheck();
+        const replayed = replayTodayTelegramEvents(telegramSessionState);
+        if (replayed > 0) {
+          emit('signals:parsed', {
+            count: replayed,
+            skipped: 0,
+            source: 'telegram',
+            message: `📨 Telegram: ${replayed} mensagem(ns) de hoje reaplicada(s) após conexão Deriv.`,
+          });
+        }
 
       } else {
         // ── API Legada ─────────────────────────────────────────────────────
@@ -261,6 +340,15 @@ io.on('connection', (socket) => {
         });
 
         startHealthCheck();
+        const replayed = replayTodayTelegramEvents(telegramSessionState);
+        if (replayed > 0) {
+          emit('signals:parsed', {
+            count: replayed,
+            skipped: 0,
+            source: 'telegram',
+            message: `📨 Telegram: ${replayed} mensagem(ns) de hoje reaplicada(s) após conexão Deriv.`,
+          });
+        }
       }
 
     } catch (err) {
@@ -432,16 +520,13 @@ io.on('connection', (socket) => {
 });
 
 if (telegramSource) {
-  telegramSource.start(({ text, chatId, from, messageId }) => {
+  telegramSource.start((event) => {
+    const { chatId, from, messageId } = event;
     let delivered = 0;
+    cacheTelegramEvent(event);
 
     for (const session of telegramSessions.values()) {
-      if (!session.isConnected()) continue;
-      const result = session.scheduleFromPayload({
-        signalsText: text,
-        source: 'telegram',
-      });
-      if (result.ok) delivered++;
+      if (applyTelegramEventToSession(session, event)) delivered++;
     }
 
     if (delivered > 0) {
@@ -449,13 +534,15 @@ if (telegramSource) {
     } else {
       console.log(`[Telegram] Mensagem #${messageId} recebida, mas sem sessão Deriv conectada.`);
     }
+  }).catch((err) => {
+    console.error(`[Telegram] Falha ao iniciar listener: ${err.message}`);
   });
 } else {
-  console.log('[Telegram] Automação desativada. Defina TELEGRAM_BOT_TOKEN para ativar.');
+  console.log('[Telegram] Automação desativada. Defina TELEGRAM_SESSION ou TELEGRAM_BOT_TOKEN para ativar.');
 }
 
-const shutdown = () => {
-  if (telegramSource) telegramSource.stop();
+const shutdown = async () => {
+  if (telegramSource) await telegramSource.stop();
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
